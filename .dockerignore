@@ -1,0 +1,33 @@
+# Git
+.git
+.gitignore
+
+# Environment
+.env
+
+# Session files (will be created in container)
+session/
+*.session
+
+# Logs (will be created in container)
+logs/
+*.log
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.Python
+
+# IDEs
+.vscode/
+.idea/
+*.swp
+
+# Documentation
+README.md
+.env.example
+
+# Docker
+Dockerfile
+.dockerignore
