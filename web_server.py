@@ -1,108 +1,168 @@
 import os
 import sys
 import base64
+import gzip
 import asyncio
-from fastapi import FastAPI, HTTPException, Query
+import boto3
+from botocore.config import Config
+from fastapi import FastAPI, HTTPException, Query, UploadFile, File
 from telethon import TelegramClient
 from dotenv import load_dotenv
+import uvicorn
 
-# 加载 .env 文件 (本地开发用，Railway 上主要靠环境变量)
+# 加载 .env
 load_dotenv()
 
 # ================= 配置区域 =================
-API_ID = int(os.getenv("API_ID"))
+API_ID = os.getenv("API_ID")
 API_HASH = os.getenv("API_HASH")
-SESSION_NAME = os.getenv("SESSION_NAME", "telegram_checkin") # 对应你的文件名前缀
-BOT_ID = int(os.getenv("BOT_ID", "123475678"))
+SESSION_NAME = os.getenv("SESSION_NAME", "telegram_checkin")
+BOT_ID = os.getenv("BOT_ID", "481731051")
 COMMAND = os.getenv("COMMAND", "/checkin")
 SECRET_KEY = os.getenv("SECRET_KEY", "change_me_secret")
 
-# Session 文件路径
+# R2 配置 (从环境变量读取)
+R2_BUCKET_NAME = os.getenv("R2_BUCKET_NAME")
+R2_ACCOUNT_ID = os.getenv("R2_ACCOUNT_ID")
+R2_ACCESS_KEY_ID = os.getenv("R2_ACCESS_KEY_ID")
+R2_SECRET_ACCESS_KEY = os.getenv("R2_SECRET_ACCESS_KEY")
+R2_OBJECT_KEY = os.getenv("R2_OBJECT_KEY", "telegram_checkin.session") # R2 里的文件名
+
+# 路径配置
 SESSION_DIR = "./sessions"
 SESSION_FILE_PATH = os.path.join(SESSION_DIR, f"{SESSION_NAME}.session")
 
-# ================= 初始化 Session 文件 =================
-def init_session_file():
-    """如果 session 文件不存在，尝试从环境变量解码生成"""
-    if not os.path.exists(SESSION_FILE_PATH):
-        os.makedirs(SESSION_DIR, exist_ok=True)
-        encoded_session = os.getenv("SESSION_FILE_BASE64")
-        
-        if encoded_session:
-            try:
-                print("🔄 正在从环境变量还原 Session 文件...")
-                session_data = base64.b64decode(encoded_session)
-                with open(SESSION_FILE_PATH, "wb") as f:
-                    f.write(session_data)
-                print(f"✅ Session 文件已成功还原到: {SESSION_FILE_PATH}")
-            except Exception as e:
-                print(f"❌ 还原 Session 失败: {e}")
-                sys.exit(1)
-        else:
-            print("❌ 错误: 未找到 Session 文件，且未提供 SESSION_FILE_BASE64 环境变量")
-            sys.exit(1)
-    else:
-        print(f"✅ 检测到现有 Session 文件: {SESSION_FILE_PATH}")
-
-# ================= 核心签到逻辑 =================
-async def run_checkin_task():
-    """执行 Telethon 签到任务"""
-    client = TelegramClient(SESSION_FILE_PATH, API_ID, API_HASH)
+# ================= R2 客户端初始化 =================
+def get_r2_client():
+    if not all([R2_BUCKET_NAME, R2_ACCOUNT_ID, R2_ACCESS_KEY_ID, R2_SECRET_ACCESS_KEY]):
+        return None
     
+    # 构建 R2 的 S3 兼容端点
+    endpoint_url = f"https://{R2_ACCOUNT_ID}.r2.cloudflarestorage.com"
+    
+    session = boto3.Session(
+        aws_access_key_id=R2_ACCESS_KEY_ID,
+        aws_secret_access_key=R2_SECRET_ACCESS_KEY,
+    )
+    
+    s3 = session.client(
+        's3',
+        endpoint_url=endpoint_url,
+        config=Config(signature_version='s3v4'),
+        region_name='auto' # R2 不需要特定 region
+    )
+    return s3
+
+# ================= 初始化逻辑 (核心) =================
+def init_session_file():
+    os.makedirs(SESSION_DIR, exist_ok=True)
+
+    # 1. 检查本地是否存在
+    if os.path.exists(SESSION_FILE_PATH):
+        print(f"✅ 发现本地 Session 文件: {SESSION_FILE_PATH}")
+        return True
+
+    print("⚠️ 本地无 Session 文件，尝试从源恢复...")
+
+    # 2. 尝试从 R2 下载
+    if get_r2_client():
+        print("🌐 尝试从 Cloudflare R2 下载 Session...")
+        try:
+            s3 = get_r2_client()
+            obj = s3.get_object(Bucket=R2_BUCKET_NAME, Key=R2_OBJECT_KEY)
+            data = obj['Body'].read()
+            
+            with open(SESSION_FILE_PATH, "wb") as f:
+                f.write(data)
+            
+            print(f"✅ 成功从 R2 下载并保存 Session (大小: {len(data)} bytes)")
+            return True
+        except Exception as e:
+            print(f"❌ R2 下载失败: {e}")
+    
+    # 3. 尝试从环境变量 (压缩版) 还原 (备用方案)
+    encoded_session = os.getenv("COMPRESSED_SESSION_BASE64")
+    if encoded_session:
+        try:
+            print("🔄 尝试从环境变量还原...")
+            compressed_data = base64.b64decode(encoded_session)
+            session_data = gzip.decompress(compressed_data)
+            with open(SESSION_FILE_PATH, "wb") as f:
+                f.write(session_data)
+            print("✅ 从环境变量还原成功。")
+            return True
+        except Exception as e:
+            print(f"⚠️ 环境变量还原失败: {e}")
+
+    # 4. 如果都失败
+    print("⚠️ 警告: 未找到 Session 文件 (本地/R2/Env 均无)。")
+    print("⚠️ 服务将启动，请通过 POST /upload_session 接口上传文件。")
+    return False
+
+# ================= 签到逻辑 =================
+async def run_checkin_task():
+    if not os.path.exists(SESSION_FILE_PATH):
+        return {"status": "error", "message": "Session file missing."}
+    
+    try:
+        api_id_int = int(API_ID)
+    except (ValueError, TypeError):
+        return {"status": "error", "message": "Invalid API_ID"}
+
+    client = TelegramClient(SESSION_FILE_PATH, api_id_int, API_HASH)
     try:
         await client.start()
         if not await client.is_user_authorized():
-            return {"status": "error", "message": "用户未授权，Session 可能已失效"}
+            return {"status": "error", "message": "User not authorized"}
         
-        print(f"🚀 正在向机器人 {BOT_ID} 发送命令: {COMMAND}")
+        print(f"🚀 发送命令 {COMMAND} 到 {BOT_ID}")
         await client.send_message(BOT_ID, COMMAND)
-        print("✅ 命令发送成功！")
-        return {"status": "success", "message": f"已向 {BOT_ID} 发送 {COMMAND}"}
-    
+        return {"status": "success", "message": "Checkin sent!"}
     except Exception as e:
-        error_msg = str(e)
-        print(f"❌ 发生错误: {error_msg}")
-        return {"status": "error", "message": error_msg}
+        return {"status": "error", "message": str(e)}
     finally:
         await client.disconnect()
 
-# ================= FastAPI 服务 =================
-app = FastAPI()
+# ================= FastAPI 应用 =================
+app = FastAPI(title="TG Auto Checkin (R2 Mode)")
 
 @app.get("/")
-def read_root():
+def home():
+    has_file = os.path.exists(SESSION_FILE_PATH)
+    r2_configured = bool(get_r2_client())
     return {
-        "service": "TgAutoCheckin-Web",
-        "status": "running",
-        "target_bot": BOT_ID
+        "status": "running", 
+        "session_exists": has_file,
+        "r2_enabled": r2_configured,
+        "msg": "Ready." if has_file else "Waiting for session file (R2 or Upload)."
     }
 
 @app.get("/trigger")
-async def trigger_checkin(secret: str = Query(...)):
-    """
-    触发签到的接口
-    用法: GET /trigger?secret=你的密钥
-    """
+async def trigger(secret: str = Query(...)):
     if secret != SECRET_KEY:
-        raise HTTPException(status_code=403, detail="Invalid secret key")
-    
-    # 执行异步任务
+        raise HTTPException(status_code=403, detail="Invalid secret")
     result = await run_checkin_task()
+    return result
+
+@app.post("/upload_session")
+async def upload_session(file: UploadFile = File(...), secret: str = Query(...)):
+    if secret != SECRET_KEY:
+        raise HTTPException(status_code=403, detail="Invalid secret")
+    if not file.filename.endswith(".session"):
+        raise HTTPException(status_code=400, detail="Must be .session file")
+
+    os.makedirs(SESSION_DIR, exist_ok=True)
+    content = await file.read()
+    with open(SESSION_FILE_PATH, "wb") as f:
+        f.write(content)
     
-    if result["status"] == "success":
-        return result
-    else:
-        # 即使业务逻辑失败，也返回 200 OK 给 Cloudflare，避免触发重试风暴
-        # 具体错误信息在 body 中
-        return result
+    # 【可选】上传成功后，也可以反向同步回 R2，方便备份
+    # 这里暂不实现，保持简单
+    
+    return {"status": "success", "message": "Uploaded! Please Restart service."}
 
 if __name__ == "__main__":
-    import uvicorn
-    # Railway 会自动注入 PORT 环境变量
     port = int(os.getenv("PORT", "8000"))
-    
-    print("🔧 正在初始化环境...")
     init_session_file()
-    
-    print(f"🌐 服务启动在端口 {port}...")
+    print(f"🌐 Server starting on port {port}...")
     uvicorn.run(app, host="0.0.0.0", port=port)
